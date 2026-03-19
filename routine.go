@@ -35,6 +35,9 @@ import (
 // errorLogger is the logger to print error message
 var errorLogger = log.New(os.Stderr, "ERROR: ", log.LstdFlags)
 
+// infoLogger is the logger to print informational messages
+var infoLogger = log.New(os.Stderr, "INFO: ", log.LstdFlags)
+
 // CredentialValidator stores the authentication data of a socks5 proxy
 type CredentialValidator struct {
 	username string
@@ -464,6 +467,136 @@ func (d VirtualTun) StartPingIPs() {
 		for {
 			d.pingIPs()
 			time.Sleep(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
+		}
+	}()
+}
+
+// peerHandshakeStatus holds parsed handshake info for a single peer
+type peerHandshakeStatus struct {
+	publicKeyShort string
+	lastHandshake  time.Time
+	endpoint       string
+	txBytes        uint64
+	rxBytes        uint64
+}
+
+// parsePeerStatuses parses IpcGet output and returns peer handshake statuses
+func parsePeerStatuses(ipcOutput string) []peerHandshakeStatus {
+	var peers []peerHandshakeStatus
+	var current *peerHandshakeStatus
+	var lastHandshakeSec, lastHandshakeNsec int64
+
+	for _, line := range strings.Split(ipcOutput, "\n") {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key, value := parts[0], parts[1]
+
+		switch key {
+		case "public_key":
+			if current != nil {
+				current.lastHandshake = time.Unix(lastHandshakeSec, lastHandshakeNsec)
+				peers = append(peers, *current)
+			}
+			short := value
+			if len(short) > 8 {
+				short = short[:8] + "..."
+			}
+			current = &peerHandshakeStatus{publicKeyShort: short}
+			lastHandshakeSec = 0
+			lastHandshakeNsec = 0
+		case "last_handshake_time_sec":
+			if v, err := strconv.ParseInt(value, 10, 64); err == nil {
+				lastHandshakeSec = v
+			}
+		case "last_handshake_time_nsec":
+			if v, err := strconv.ParseInt(value, 10, 64); err == nil {
+				lastHandshakeNsec = v
+			}
+		case "endpoint":
+			if current != nil {
+				current.endpoint = value
+			}
+		case "tx_bytes":
+			if current != nil {
+				if v, err := strconv.ParseUint(value, 10, 64); err == nil {
+					current.txBytes = v
+				}
+			}
+		case "rx_bytes":
+			if current != nil {
+				if v, err := strconv.ParseUint(value, 10, 64); err == nil {
+					current.rxBytes = v
+				}
+			}
+		}
+	}
+	if current != nil {
+		current.lastHandshake = time.Unix(lastHandshakeSec, lastHandshakeNsec)
+		peers = append(peers, *current)
+	}
+	return peers
+}
+
+// StartPeerHealthMonitor monitors peer handshake health and rebinds the UDP socket
+// when handshakes have been stale for too long, which fixes NAT mapping timeouts
+// and stale socket issues without requiring a full restart.
+func (d VirtualTun) StartPeerHealthMonitor() {
+	const (
+		checkInterval    = 30 * time.Second
+		handshakeTimeout = 150 * time.Second // ~RekeyAttemptTime (90s) + margin
+		rebindCooldown   = 120 * time.Second // min time between rebinds
+	)
+
+	var lastRebind time.Time
+
+	go func() {
+		// Wait for initial handshake to establish
+		time.Sleep(checkInterval)
+
+		for {
+			time.Sleep(checkInterval)
+
+			ipcOutput, err := d.Dev.IpcGet()
+			if err != nil {
+				errorLogger.Printf("Health monitor: failed to get device status: %s\n", err)
+				continue
+			}
+
+			peers := parsePeerStatuses(ipcOutput)
+			now := time.Now()
+			allStale := len(peers) > 0
+
+			for _, peer := range peers {
+				sinceHandshake := now.Sub(peer.lastHandshake)
+
+				// A zero handshake time means no handshake has ever completed
+				neverConnected := peer.lastHandshake.IsZero() || peer.lastHandshake.Unix() == 0
+				stale := neverConnected || sinceHandshake > handshakeTimeout
+
+				if stale {
+					if neverConnected {
+						errorLogger.Printf("Health monitor: peer(%s) endpoint=%s has never completed a handshake (tx=%d rx=%d)\n",
+							peer.publicKeyShort, peer.endpoint, peer.txBytes, peer.rxBytes)
+					} else {
+						errorLogger.Printf("Health monitor: peer(%s) endpoint=%s last handshake %s ago (tx=%d rx=%d)\n",
+							peer.publicKeyShort, peer.endpoint, sinceHandshake.Round(time.Second), peer.txBytes, peer.rxBytes)
+					}
+				} else {
+					allStale = false
+				}
+			}
+
+			if allStale && time.Since(lastRebind) > rebindCooldown {
+				infoLogger.Printf("Health monitor: all peers have stale handshakes, rebinding UDP socket\n")
+				if err := d.Dev.BindUpdate(); err != nil {
+					errorLogger.Printf("Health monitor: UDP rebind failed: %s\n", err)
+				} else {
+					infoLogger.Printf("Health monitor: UDP rebind successful, handshakes should re-initiate\n")
+					lastRebind = now
+				}
+			}
 		}
 	}()
 }

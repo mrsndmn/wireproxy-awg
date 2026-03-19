@@ -254,6 +254,7 @@ func main() {
 	}
 
 	tun.StartPingIPs()
+	tun.StartPeerHealthMonitor()
 
 	if *info != "" {
 		go func() {
