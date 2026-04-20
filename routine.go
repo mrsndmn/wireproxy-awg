@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/amnezia-vpn/amneziawg-go/device"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -539,17 +540,22 @@ func parsePeerStatuses(ipcOutput string) []peerHandshakeStatus {
 	return peers
 }
 
-// StartPeerHealthMonitor monitors peer handshake health and rebinds the UDP socket
-// when handshakes have been stale for too long, which fixes NAT mapping timeouts
-// and stale socket issues without requiring a full restart.
+// StartPeerHealthMonitor monitors peer handshake health and cycles the device
+// (Down + Up) when handshakes have been stale for too long. This fully resets
+// peer state (keypairs, handshake timers, UDP socket) — equivalent to a restart
+// but without killing the process. Fixes NAT mapping timeouts, stale sockets,
+// and stuck handshake state.
 func (d VirtualTun) StartPeerHealthMonitor() {
 	const (
-		checkInterval    = 30 * time.Second
-		handshakeTimeout = 150 * time.Second // ~RekeyAttemptTime (90s) + margin
-		rebindCooldown   = 120 * time.Second // min time between rebinds
+		checkInterval    = 15 * time.Second
+		handshakeTimeout = 90 * time.Second // RekeyAttemptTime (90s)
+		resetCooldown    = 90 * time.Second // min time between device resets
 	)
 
-	var lastRebind time.Time
+	infoLogger.Printf("Health monitor: started (check=%s, stale_threshold=%s, cooldown=%s)\n",
+		checkInterval, handshakeTimeout, resetCooldown)
+
+	var lastReset time.Time
 
 	go func() {
 		// Wait for initial handshake to establish
@@ -566,7 +572,8 @@ func (d VirtualTun) StartPeerHealthMonitor() {
 
 			peers := parsePeerStatuses(ipcOutput)
 			now := time.Now()
-			allStale := len(peers) > 0
+			staleCount := 0
+			totalCount := len(peers)
 
 			for _, peer := range peers {
 				sinceHandshake := now.Sub(peer.lastHandshake)
@@ -576,6 +583,7 @@ func (d VirtualTun) StartPeerHealthMonitor() {
 				stale := neverConnected || sinceHandshake > handshakeTimeout
 
 				if stale {
+					staleCount++
 					if neverConnected {
 						errorLogger.Printf("Health monitor: peer(%s) endpoint=%s has never completed a handshake (tx=%d rx=%d)\n",
 							peer.publicKeyShort, peer.endpoint, peer.txBytes, peer.rxBytes)
@@ -583,19 +591,40 @@ func (d VirtualTun) StartPeerHealthMonitor() {
 						errorLogger.Printf("Health monitor: peer(%s) endpoint=%s last handshake %s ago (tx=%d rx=%d)\n",
 							peer.publicKeyShort, peer.endpoint, sinceHandshake.Round(time.Second), peer.txBytes, peer.rxBytes)
 					}
-				} else {
-					allStale = false
 				}
 			}
 
-			if allStale && time.Since(lastRebind) > rebindCooldown {
-				infoLogger.Printf("Health monitor: all peers have stale handshakes, rebinding UDP socket\n")
-				if err := d.Dev.BindUpdate(); err != nil {
-					errorLogger.Printf("Health monitor: UDP rebind failed: %s\n", err)
-				} else {
-					infoLogger.Printf("Health monitor: UDP rebind successful, handshakes should re-initiate\n")
-					lastRebind = now
+			allStale := totalCount > 0 && staleCount == totalCount
+			sinceLast := time.Since(lastReset)
+			cooldownReady := sinceLast > resetCooldown
+
+			if allStale && !cooldownReady {
+				infoLogger.Printf("Health monitor: %d/%d peers stale, but in cooldown (%s since last reset, need %s)\n",
+					staleCount, totalCount, sinceLast.Round(time.Second), resetCooldown)
+			}
+
+			if allStale && cooldownReady {
+				infoLogger.Printf("Health monitor: %d/%d peers stale, cycling device (Down+Up) with port reset\n", staleCount, totalCount)
+				if err := d.Dev.Down(); err != nil {
+					errorLogger.Printf("Health monitor: device Down failed: %s\n", err)
+					continue
 				}
+				// Reset listen port to configured value (0 = random) so Up()
+				// gets a fresh UDP source port, clearing stale NAT/conntrack state.
+				// This is the key difference vs a plain Down+Up which reuses the old port.
+				listenPort := 0
+				if d.Conf.ListenPort != nil {
+					listenPort = *d.Conf.ListenPort
+				}
+				if err := d.Dev.IpcSet(fmt.Sprintf("listen_port=%d\n", listenPort)); err != nil {
+					errorLogger.Printf("Health monitor: listen_port reset failed: %s\n", err)
+				}
+				if err := d.Dev.Up(); err != nil {
+					errorLogger.Printf("Health monitor: device Up failed: %s\n", err)
+					continue
+				}
+				infoLogger.Printf("Health monitor: device cycled successfully, peer state reset\n")
+				lastReset = now
 			}
 		}
 	}()
