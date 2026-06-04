@@ -474,6 +474,7 @@ func (d VirtualTun) StartPingIPs() {
 
 // peerHandshakeStatus holds parsed handshake info for a single peer
 type peerHandshakeStatus struct {
+	publicKeyHex   string
 	publicKeyShort string
 	lastHandshake  time.Time
 	endpoint       string
@@ -504,7 +505,7 @@ func parsePeerStatuses(ipcOutput string) []peerHandshakeStatus {
 			if len(short) > 8 {
 				short = short[:8] + "..."
 			}
-			current = &peerHandshakeStatus{publicKeyShort: short}
+			current = &peerHandshakeStatus{publicKeyHex: value, publicKeyShort: short}
 			lastHandshakeSec = 0
 			lastHandshakeNsec = 0
 		case "last_handshake_time_sec":
@@ -540,22 +541,53 @@ func parsePeerStatuses(ipcOutput string) []peerHandshakeStatus {
 	return peers
 }
 
+// forceHandshake actively initiates a WireGuard handshake for the peer with the
+// given hex public key. WireGuard only (re)handshakes lazily when it has data to
+// send, so an idle-but-healthy tunnel's last_handshake_time ages indefinitely and
+// a fresh device (post Down+Up) never re-handshakes on its own. This makes the
+// handshake happen on demand: as a liveness probe for "stale" peers, and to drive
+// recovery after a device cycle.
+func (d VirtualTun) forceHandshake(pubHex string) {
+	var pk device.NoisePublicKey
+	if err := pk.FromHex(pubHex); err != nil {
+		return
+	}
+	peer := d.Dev.LookupPeer(pk)
+	if peer == nil {
+		return
+	}
+	// SendHandshakeInitiation self-rate-limits (RekeyTimeout), so calling it on
+	// every check is safe.
+	_ = peer.SendHandshakeInitiation(false)
+}
+
 // StartPeerHealthMonitor monitors peer handshake health and cycles the device
-// (Down + Up) when handshakes have been stale for too long. This fully resets
-// peer state (keypairs, handshake timers, UDP socket) — equivalent to a restart
-// but without killing the process. Fixes NAT mapping timeouts, stale sockets,
-// and stuck handshake state.
+// (Down + Up) when a peer is genuinely unreachable. This fully resets peer state
+// (keypairs, handshake timers, UDP socket) — equivalent to a restart but without
+// killing the process. Fixes NAT mapping timeouts, stale sockets, and stuck
+// handshake state.
+//
+// WireGuard is silent by design: it only renews a handshake when it has outbound
+// traffic and the keypair is older than REKEY_AFTER_TIME (120s). An idle tunnel's
+// last_handshake_time therefore ages forever even though the link is perfectly
+// healthy. To avoid false positives we never treat "old handshake" as failure on
+// its own — instead we actively probe (force a handshake) and only escalate to a
+// device cycle after several consecutive probes fail to refresh the handshake.
 func (d VirtualTun) StartPeerHealthMonitor() {
 	const (
 		checkInterval    = 15 * time.Second
-		handshakeTimeout = 90 * time.Second // RekeyAttemptTime (90s)
-		resetCooldown    = 90 * time.Second // min time between device resets
+		handshakeTimeout = 150 * time.Second // above REKEY_AFTER_TIME (120s) + margin
+		staleStrikes     = 3                  // failed probes (≈45s) before cycling
+		resetCooldown    = 90 * time.Second   // min time between device resets
 	)
 
-	infoLogger.Printf("Health monitor: started (check=%s, stale_threshold=%s, cooldown=%s)\n",
-		checkInterval, handshakeTimeout, resetCooldown)
+	infoLogger.Printf("Health monitor: started (check=%s, stale_threshold=%s, strikes=%d, cooldown=%s)\n",
+		checkInterval, handshakeTimeout, staleStrikes, resetCooldown)
 
 	var lastReset time.Time
+	// strikes counts consecutive checks (per peer) where, after an active probe,
+	// the handshake still hasn't refreshed. Keyed by public key hex.
+	strikes := make(map[string]int)
 
 	go func() {
 		// Wait for initial handshake to establish
@@ -572,39 +604,63 @@ func (d VirtualTun) StartPeerHealthMonitor() {
 
 			peers := parsePeerStatuses(ipcOutput)
 			now := time.Now()
-			staleCount := 0
+			hardStaleCount := 0
 			totalCount := len(peers)
+			seen := make(map[string]bool, totalCount)
 
 			for _, peer := range peers {
+				seen[peer.publicKeyHex] = true
 				sinceHandshake := now.Sub(peer.lastHandshake)
 
 				// A zero handshake time means no handshake has ever completed
 				neverConnected := peer.lastHandshake.IsZero() || peer.lastHandshake.Unix() == 0
-				stale := neverConnected || sinceHandshake > handshakeTimeout
+				candidate := neverConnected || sinceHandshake > handshakeTimeout
 
-				if stale {
-					staleCount++
-					if neverConnected {
-						errorLogger.Printf("Health monitor: peer(%s) endpoint=%s has never completed a handshake (tx=%d rx=%d)\n",
-							peer.publicKeyShort, peer.endpoint, peer.txBytes, peer.rxBytes)
-					} else {
-						errorLogger.Printf("Health monitor: peer(%s) endpoint=%s last handshake %s ago (tx=%d rx=%d)\n",
-							peer.publicKeyShort, peer.endpoint, sinceHandshake.Round(time.Second), peer.txBytes, peer.rxBytes)
-					}
+				if !candidate {
+					// Healthy (handshake fresh enough); clear any accumulated strikes.
+					delete(strikes, peer.publicKeyHex)
+					continue
+				}
+
+				// Actively probe: force a handshake. If the link is just idle but
+				// healthy, this refreshes the handshake within a couple seconds and
+				// the peer will be back under threshold on the next check. If the
+				// server is truly gone, the probe gets no response.
+				d.forceHandshake(peer.publicKeyHex)
+				strikes[peer.publicKeyHex]++
+				strikeCount := strikes[peer.publicKeyHex]
+
+				if neverConnected {
+					errorLogger.Printf("Health monitor: peer(%s) endpoint=%s no handshake yet, probing (strike %d/%d, tx=%d rx=%d)\n",
+						peer.publicKeyShort, peer.endpoint, strikeCount, staleStrikes, peer.txBytes, peer.rxBytes)
+				} else {
+					errorLogger.Printf("Health monitor: peer(%s) endpoint=%s last handshake %s ago, probing (strike %d/%d, tx=%d rx=%d)\n",
+						peer.publicKeyShort, peer.endpoint, sinceHandshake.Round(time.Second), strikeCount, staleStrikes, peer.txBytes, peer.rxBytes)
+				}
+
+				if strikeCount >= staleStrikes {
+					hardStaleCount++
 				}
 			}
 
-			allStale := totalCount > 0 && staleCount == totalCount
+			// Drop strike state for peers that disappeared from the config.
+			for k := range strikes {
+				if !seen[k] {
+					delete(strikes, k)
+				}
+			}
+
+			allStale := totalCount > 0 && hardStaleCount == totalCount
 			sinceLast := time.Since(lastReset)
 			cooldownReady := sinceLast > resetCooldown
 
 			if allStale && !cooldownReady {
-				infoLogger.Printf("Health monitor: %d/%d peers stale, but in cooldown (%s since last reset, need %s)\n",
-					staleCount, totalCount, sinceLast.Round(time.Second), resetCooldown)
+				infoLogger.Printf("Health monitor: %d/%d peers unreachable, but in cooldown (%s since last reset, need %s)\n",
+					hardStaleCount, totalCount, sinceLast.Round(time.Second), resetCooldown)
 			}
 
 			if allStale && cooldownReady {
-				infoLogger.Printf("Health monitor: %d/%d peers stale, cycling device (Down+Up) with port reset\n", staleCount, totalCount)
+				infoLogger.Printf("Health monitor: %d/%d peers unreachable after %d probes, cycling device (Down+Up) with port reset\n", hardStaleCount, totalCount, staleStrikes)
 				if err := d.Dev.Down(); err != nil {
 					errorLogger.Printf("Health monitor: device Down failed: %s\n", err)
 					continue
@@ -623,8 +679,14 @@ func (d VirtualTun) StartPeerHealthMonitor() {
 					errorLogger.Printf("Health monitor: device Up failed: %s\n", err)
 					continue
 				}
-				infoLogger.Printf("Health monitor: device cycled successfully, peer state reset\n")
+				// A fresh device won't handshake until it has traffic to send, so
+				// drive the reconnect explicitly instead of waiting for user traffic.
+				for _, peer := range peers {
+					d.forceHandshake(peer.publicKeyHex)
+				}
+				infoLogger.Printf("Health monitor: device cycled successfully, handshake re-initiated for %d peer(s)\n", totalCount)
 				lastReset = now
+				strikes = make(map[string]int)
 			}
 		}
 	}()
