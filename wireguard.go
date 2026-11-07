@@ -9,9 +9,9 @@ import (
 	"net/netip"
 
 	"github.com/MakeNowJust/heredoc/v2"
-	"github.com/amnezia-vpn/amneziawg-go/conn"
-	"github.com/amnezia-vpn/amneziawg-go/device"
-	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 )
 
 // DeviceSetting contains the parameters for setting up a tun interface
@@ -97,6 +97,19 @@ func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 		}
 		if aSecConfig.i5 != nil {
 			aSecBuilder.WriteString(fmt.Sprintf("i5=%s\n", *aSecConfig.i5))
+		}
+		if value, ok := aSecConfig.awg31Settings["header_protection_key"]; ok {
+			aSecBuilder.WriteString("header_protection_key=" + value + "\n")
+		}
+		for _, field := range awg31RangeSettings {
+			if value, ok := aSecConfig.awg31Settings[field.ipc]; ok {
+				aSecBuilder.WriteString(field.ipc + "=" + value + "\n")
+			}
+		}
+		for _, field := range awg31BoolSettings {
+			if value, ok := aSecConfig.awg31Settings[field.ipc]; ok {
+				aSecBuilder.WriteString(field.ipc + "=" + value + "\n")
+			}
 		}
 
 		request.WriteString(aSecBuilder.String())

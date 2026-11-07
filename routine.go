@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/amnezia-vpn/amneziawg-go/device"
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -30,7 +30,7 @@ import (
 
 	"net/netip"
 
-	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 )
 
 // errorLogger is the logger to print error message
@@ -577,8 +577,8 @@ func (d VirtualTun) StartPeerHealthMonitor() {
 	const (
 		checkInterval    = 15 * time.Second
 		handshakeTimeout = 150 * time.Second // above REKEY_AFTER_TIME (120s) + margin
-		staleStrikes     = 3                  // failed probes (≈45s) before cycling
-		resetCooldown    = 90 * time.Second   // min time between device resets
+		staleStrikes     = 3                 // failed probes (≈45s) before cycling
+		resetCooldown    = 90 * time.Second  // min time between device resets
 	)
 
 	infoLogger.Printf("Health monitor: started (check=%s, stale_threshold=%s, strikes=%d, cooldown=%s)\n",

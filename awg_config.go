@@ -1,7 +1,10 @@
 package wireproxy
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -40,6 +43,21 @@ type ASecConfigType struct {
 	i3                            *string
 	i4                            *string
 	i5                            *string
+	awg31Settings                 map[string]string
+}
+
+var awg31RangeSettings = []struct{ config, ipc string }{
+	{"ContentPaddingAddition", "content_padding_addition"},
+	{"RekeyAfterTime", "rekey_after_time"},
+	{"RekeyTimeout", "rekey_timeout"},
+	{"RejectAfterTime", "reject_after_time"},
+	{"KeepaliveTimeout", "keepalive_timeout"},
+	{"MaxHandshakeAttempts", "max_handshake_attempts"},
+}
+
+var awg31BoolSettings = []struct{ config, ipc string }{
+	{"RandomTrailers", "random_trailers"},
+	{"DisableCookies", "disable_cookies"},
 }
 
 func ParseASecConfig(section *ini.Section) (*ASecConfigType, error) {
@@ -221,6 +239,60 @@ func ParseASecConfig(section *ini.Section) (*ASecConfigType, error) {
 		aSecConfig.i5 = &value
 	}
 
+	if section.HasKey("HeaderProtectionKey") {
+		value, err := parseString(section, "HeaderProtectionKey")
+		if err != nil {
+			return nil, fmt.Errorf("HeaderProtectionKey: %w", err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err != nil || len(decoded) != 32 {
+			return nil, errors.New("HeaderProtectionKey must be a base64-encoded 32-byte key")
+		}
+		if aSecConfig == nil {
+			aSecConfig = &ASecConfigType{}
+		}
+		aSecConfig.awg31Settings = map[string]string{"header_protection_key": hex.EncodeToString(decoded)}
+	}
+	for _, field := range awg31RangeSettings {
+		key, err := section.GetKey(field.config)
+		if err != nil {
+			continue
+		}
+		value := strings.TrimSpace(key.String())
+		if err := validateAWG31Range(value); err != nil {
+			return nil, fmt.Errorf("%s: %w", field.config, err)
+		}
+		if aSecConfig == nil {
+			aSecConfig = &ASecConfigType{}
+		}
+		if aSecConfig.awg31Settings == nil {
+			aSecConfig.awg31Settings = make(map[string]string)
+		}
+		aSecConfig.awg31Settings[field.ipc] = value
+	}
+	for _, field := range awg31BoolSettings {
+		key, err := section.GetKey(field.config)
+		if err != nil {
+			continue
+		}
+		value := strings.ToLower(strings.TrimSpace(key.String()))
+		switch value {
+		case "on", "true", "1":
+			value = "true"
+		case "off", "false", "0":
+			value = "false"
+		default:
+			return nil, fmt.Errorf("%s must be on or off", field.config)
+		}
+		if aSecConfig == nil {
+			aSecConfig = &ASecConfigType{}
+		}
+		if aSecConfig.awg31Settings == nil {
+			aSecConfig.awg31Settings = make(map[string]string)
+		}
+		aSecConfig.awg31Settings[field.ipc] = value
+	}
+
 	if err := ValidateASecConfig(aSecConfig); err != nil {
 		return nil, err
 	}
@@ -228,9 +300,43 @@ func ParseASecConfig(section *ini.Section) (*ASecConfigType, error) {
 	return aSecConfig, nil
 }
 
+func validateAWG31Range(value string) error {
+	parts := strings.Split(value, "-")
+	if len(parts) < 1 || len(parts) > 2 {
+		return errors.New("expected a number or min-max range")
+	}
+	min, err := strconv.ParseUint(parts[0], 10, 16)
+	if err != nil {
+		return errors.New("expected a uint16 number or range")
+	}
+	if len(parts) == 2 {
+		max, err := strconv.ParseUint(parts[1], 10, 16)
+		if err != nil || max < min {
+			return errors.New("expected an ascending uint16 range")
+		}
+	}
+	return nil
+}
+
 func ValidateASecConfig(config *ASecConfigType) error {
 	if config == nil {
 		return nil
+	}
+	if _, ok := config.awg31Settings["header_protection_key"]; ok {
+		for _, padding := range []struct {
+			name string
+			set  bool
+			size int
+		}{
+			{"S1", config.hasInitPacketJunkSize, config.initPacketJunkSize},
+			{"S2", config.hasResponsePacketJunkSize, config.responsePacketJunkSize},
+			{"S3", config.hasCookieReplyPacketJunkSize, config.cookieReplyPacketJunkSize},
+			{"S4", config.hasTransportPacketJunkSize, config.transportPacketJunkSize},
+		} {
+			if !padding.set || padding.size < 12 {
+				return fmt.Errorf("%s must be at least 12 when HeaderProtectionKey is set", padding.name)
+			}
+		}
 	}
 	if config.hasJunkPacketCount && (config.junkPacketCount < 1 || config.junkPacketCount > 128) {
 		return errors.New("value of the Jc field must be within the range of 1 to 128")

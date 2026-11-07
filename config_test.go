@@ -680,3 +680,51 @@ H1 = 2
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestAWG31ParametersReachDeviceIPC(t *testing.T) {
+	const config = `
+[Interface]
+PrivateKey = LAr1aNSNF9d0MjwUgAVC4020T0N/E5NUtqVv5EnsSz0=
+Address = 10.5.0.2
+S1 = 32
+S2 = 32
+S3 = 32
+S4 = 32
+HeaderProtectionKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+ContentPaddingAddition = 0-64
+RekeyAfterTime = 110-130
+RekeyTimeout = 4-7
+RejectAfterTime = 180-200
+KeepaliveTimeout = 8-15
+MaxHandshakeAttempts = 5-8
+RandomTrailers = on
+DisableCookies = off
+`
+	var cfg DeviceConfig
+	iniData, err := loadIniConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ParseInterface(iniData, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	setting, err := CreateIPCRequest(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"header_protection_key=" + strings.Repeat("01", 32) + "\n",
+		"content_padding_addition=0-64\n",
+		"rekey_after_time=110-130\n",
+		"rekey_timeout=4-7\n",
+		"reject_after_time=180-200\n",
+		"keepalive_timeout=8-15\n",
+		"max_handshake_attempts=5-8\n",
+		"random_trailers=true\n",
+		"disable_cookies=false\n",
+	} {
+		if !strings.Contains(setting.IpcRequest, want) {
+			t.Errorf("missing AWG 3.1 IPC field %q", strings.SplitN(want, "=", 2)[0])
+		}
+	}
+}
